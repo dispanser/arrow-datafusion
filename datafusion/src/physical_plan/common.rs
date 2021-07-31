@@ -19,13 +19,14 @@
 
 use std::fs;
 use std::fs::metadata;
+use std::path::Path;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use super::{RecordBatchStream, SendableRecordBatchStream};
 use crate::error::{DataFusionError, Result};
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Schema, SchemaRef};
 use arrow::error::Result as ArrowResult;
 use arrow::record_batch::RecordBatch;
 use futures::{Stream, TryStreamExt};
@@ -101,4 +102,157 @@ pub fn build_file_list(dir: &str, filenames: &mut Vec<String>, ext: &str) -> Res
         }
     }
     Ok(())
+}
+
+/// A partition with the files located inside the partition leaf directory.
+/// TODO: the actual partition data is not yet modelled.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub struct PartitionData {
+    /// sequence of partition values (in order of occurrence on the path to the file
+    partition_values: Vec<String>,
+
+    /// files belonging to the same partition
+    files: Vec<String>,
+}
+
+fn split_partition(name: &str) -> Option<(&str, &str)> {
+    if let Some(idx) = name.find('=') {
+        Some((&name[0..idx], &name[idx + 1..]))
+    } else {
+        None
+    }
+}
+
+/// result of scanning a directory tree for files
+pub struct PartitionScan {
+    /// the schema contains information *only* for the partition columns,
+    /// not for the data actually sitting inside the parquet files.
+    schema: SchemaRef,
+
+    /// the discovered (relevant) partitions
+    partitions: Vec<PartitionData>,
+
+    /// table root directory / root of scan operation.
+    root_dir: String,
+}
+
+/// recursively scan a directory tree, extracting the partition schema and related files
+pub fn scan_partition_tree(dir: &Path, ext: &str) -> Result<PartitionScan> {
+    let metadata = metadata(dir)?;
+    if metadata.is_file() {
+        let file_names = dir
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|f| vec![f.to_string()])
+            .unwrap_or_default();
+        let partition_data = PartitionData {
+            partition_values: vec![],
+            files: file_names,
+        };
+        Ok(PartitionScan {
+            schema: Arc::new(Schema::empty()),
+            partitions: vec![partition_data],
+            // may be OK because we already know it's a file.
+            root_dir: dir
+                .parent()
+                .and_then(|f| f.to_str())
+                .unwrap_or("")
+                .to_string(),
+        })
+    } else {
+        let mut matching_files: Vec<String> = vec![];
+        for entry in fs::read_dir(dir)? {
+            let entry = &entry?;
+            let file_type: &fs::FileType = &entry.file_type()?;
+            match file_type {
+                file_type if file_type.is_dir() => println!("dir: {:?}", entry),
+                file_type
+                    if file_type.is_file()
+                        && entry.path().to_str().unwrap().ends_with(ext) =>
+                {
+                    matching_files.push(
+                        entry
+                            .path()
+                            .file_name()
+                            .unwrap()
+                            .to_str()
+                            .unwrap()
+                            .to_string(),
+                    )
+                }
+                _ => println!("unknown: {:?}", entry),
+            }
+        }
+        println!("{:?}", matching_files);
+        Ok(PartitionScan {
+            schema: Arc::new(Schema::empty()),
+            partitions: vec![PartitionData {
+                partition_values: vec![],
+                files: matching_files,
+            }],
+            root_dir: dir.to_str().map_or("".to_string(), |f| f.to_string()),
+        })
+    }
+}
+
+// #[cfg(test)]
+mod tests {
+
+    use super::*;
+    use arrow::datatypes::{DataType, Field};
+
+    #[test]
+    fn scan_flat_parquet() {
+        // no partitions, so we expect an empty column schema, and a single partition w/ all files
+        let root_dir = Path::new(
+            "/home/data/study/rust/arrow/partitioned-dataframe-testdata/unpartitioned",
+        );
+        if let Ok(partition_scan) = scan_partition_tree(&root_dir, ".parquet") {
+            assert_eq!(*partition_scan.schema, Schema::empty());
+            let partition_values = &partition_scan.partitions[0].partition_values;
+            assert!(partition_values.is_empty());
+            let expected_files = (1..10)
+                .map(|i| format!("{}.parquet", i))
+                .collect::<Vec<String>>();
+            let file_names = &mut partition_scan.partitions[0].files.clone();
+            file_names.sort();
+            assert_eq!(file_names, &expected_files);
+        } else {
+            panic!("scan of parquet directory failed");
+        }
+    }
+
+    #[test]
+    fn scan_single_file() {
+        let root_dir =
+            "/home/data/study/rust/arrow/partitioned-dataframe-testdata/unpartitioned";
+        let file_name = "3.parquet";
+        let file_path = format!("{}/{}", root_dir, file_name);
+        if let Ok(partition_scan) = scan_partition_tree(Path::new(&file_path), ".parquet")
+        {
+            assert_eq!(*partition_scan.schema, Schema::empty());
+            let expected_partition = PartitionData {
+                partition_values: vec![],
+                files: vec![file_name.to_string()],
+            };
+            assert_eq!(vec![expected_partition], partition_scan.partitions);
+            assert_eq!(partition_scan.root_dir, root_dir);
+        } else {
+            panic!("scan of single parquet file failed");
+        }
+    }
+
+    #[test]
+    fn scan_single_partition_layer() {
+        let root_dir = "/home/data/study/rust/arrow/partitioned-dataframe-testdata/month-partitioned";
+        if let Ok(partition_scan) = scan_partition_tree(Path::new(&root_dir), ".parquet") {
+            panic!("scan of partitioned directory tree failed totally");
+        } else {
+            panic!("scan of partitioned directory tree failed");
+        }
+        // assert_eq!(*partition_scan.schema, Schema::new(vec![Field::new("date", DataType::Utf8, true)]));
+    }
+
+    #[test]
+    fn scan_contradicting_schemas() {}
 }

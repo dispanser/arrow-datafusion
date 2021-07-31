@@ -985,6 +985,21 @@ mod tests {
     use parquet::basic::Type as PhysicalType;
     use parquet::schema::types::SchemaDescPtr;
 
+    #[tokio::test]
+    async fn partitioned_parquet_source() -> Result<()> {
+        let source_root = "/home/data/study/delta/date-partitioned";
+        let parquet_exec: ParquetExec =
+            ParquetExec::try_from_path(&source_root, None, None, 1024, 4, None)?;
+        let expected_schema = Schema::new(vec![
+            Field::new("date", DataType::Date32, true),
+            Field::new("dayOfYear", DataType::Int32, true),
+        ]);
+        let schema = parquet_exec.schema;
+        assert_eq!(*schema, expected_schema);
+        println!("schema: {:#?}", schema);
+        Ok(())
+    }
+
     #[test]
     fn test_split_files() {
         let filenames = vec![
